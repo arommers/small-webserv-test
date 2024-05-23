@@ -1,4 +1,6 @@
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <cstring>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -18,48 +20,104 @@ struct Client {
     size_t writePos = 0;
 };
 
-int main() {
+std::string readIndexHTML() {
+    std::ifstream file("index.html");
+    if (!file) {
+        std::cerr << "Failed to open index.html" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+std::string readCSS() {
+    std::ifstream generalFile("css/general.css");
+    std::ifstream styleFile("css/style.css");
     
+    if (!generalFile || !styleFile) {
+        std::cerr << "Failed to open CSS files" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    std::stringstream buffer;
+    buffer << generalFile.rdbuf();
+    buffer << styleFile.rdbuf();
+    return buffer.str();
+}
+
+std::string readImage(const std::string& imagePath) {
+    std::ifstream imageFile(imagePath, std::ios::binary);
+    if (!imageFile) {
+        std::cerr << "Failed to open image file: " << imagePath << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    std::stringstream buffer;
+    buffer << imageFile.rdbuf();
+    return buffer.str();
+}
+
+std::string generateHTTPResponse(const std::string& content, const std::string& contentType) {
+    std::stringstream response;
+    response << "HTTP/1.1 200 OK\r\n";
+    response << "Content-Type: " << contentType << "\r\n";
+    response << "Content-Length: " << content.size() << "\r\n";
+    response << "\r\n"; // Empty line indicating end of headers
+    response << content; // Add the content
+    return response.str();
+}
+
+std::string extractImagePath(const char* request) {
+    std::string imagePath;
+    const char* start = std::strstr(request, "GET /img/");
+    if (start) {
+        start += 9; // Move past "GET /img/"
+        const char* end = std::strstr(start, " HTTP/1.1");
+        if (end) {
+            imagePath.assign(start, end); // Extract the image path
+        }
+    }
+    return imagePath;
+}
+
+int main() {
     struct sockaddr_in address;
     int addrLen = sizeof(address);
     int serverSocket, newSocket;
-    const char* message = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nContent-Type: text/plain\r\n\r\nHello World!";
+    std::string indexHTML = readIndexHTML();
+    std::string cssContent = readCSS();
     std::vector<struct pollfd> fds;
     std::unordered_map<int, Client> clients;
 
-    // Creating socket file descriptor
     if ((serverSocket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         std::cerr << "Socket failed: " << strerror(errno) << std::endl;
         exit(EXIT_FAILURE);
     }
 
-    // Configuring the address struct of the socket
-    address.sin_family = AF_INET; // address family
-    address.sin_addr.s_addr = INADDR_ANY; // accepts connections from any IP on the host
-    address.sin_port = htons(PORT); // ensures the port number is correctly formatted
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
 
-    // Binding the socket to the address and the port
     if (bind(serverSocket, reinterpret_cast<struct sockaddr*>(&address), addrLen) < 0) {
         std::cerr << "Bind failed: " << strerror(errno) << std::endl;
         close(serverSocket);
         exit(EXIT_FAILURE);
     }
 
-    // Socket starts listening mode
     if (listen(serverSocket, MAX_CLIENTS) < 0) {
         std::cerr << "Listen failed: " << strerror(errno) << std::endl;
         close(serverSocket);
         exit(EXIT_FAILURE);
     }
 
-    // Add the server socket to the poll file descriptor set
     struct pollfd server_fd;
     server_fd.fd = serverSocket;
-    server_fd.events = POLLIN; // We are interested in read events (incoming connections)
+    server_fd.events = POLLIN;
     fds.push_back(server_fd);
 
     while (true) {
-        // Use poll to wait for events
         int poll_count = poll(fds.data(), fds.size(), -1);
         if (poll_count == -1) {
             std::cerr << "Poll failed: " << strerror(errno) << std::endl;
@@ -70,38 +128,49 @@ int main() {
         for (size_t i = 0; i < fds.size(); ++i) {
             if (fds[i].revents & POLLIN) {
                 if (fds[i].fd == serverSocket) {
-                    // Accept new connection
                     if ((newSocket = accept(serverSocket, reinterpret_cast<struct sockaddr*>(&address), reinterpret_cast<socklen_t*>(&addrLen))) < 0) {
                         std::cerr << "Accept failed: " << strerror(errno) << std::endl;
                     } else {
                         std::cout << "New connection, socket fd is " << newSocket << ", ip is : " << inet_ntoa(address.sin_addr) << ", port : " << ntohs(address.sin_port) << std::endl;
 
-                        // Add new client socket to the poll file descriptor set
                         struct pollfd client_fd;
                         client_fd.fd = newSocket;
-                        client_fd.events = POLLIN; // We are interested in read events (incoming data)
+                        client_fd.events = POLLIN;
                         fds.push_back(client_fd);
 
-                        // Initialize client write buffer
                         clients[newSocket] = Client{newSocket};
                     }
                 } else {
-                    // Handle data from a client socket
                     char buffer[BUFFER_SIZE] = {0};
                     int valread = read(fds[i].fd, buffer, BUFFER_SIZE);
                     if (valread == 0) {
-                        // Client disconnected
                         std::cout << "Client disconnected, socket fd is " << fds[i].fd << std::endl;
                         close(fds[i].fd);
                         clients.erase(fds[i].fd);
                         fds.erase(fds.begin() + i);
-                        --i; // Adjust index after removal
+                        --i;
                     } else {
-                        // Prepare response to be sent
                         std::cout << "Received message: " << buffer << std::endl;
-                        clients[fds[i].fd].writeBuffer = message;
+                        std::string contentType;
+                        std::string responseContent;
+                        if (strstr(buffer, "GET /styles.css")) {
+                            contentType = "text/css";
+                            responseContent = cssContent;
+                        } else {
+                            std::string imagePath = extractImagePath(buffer);
+                            if (!imagePath.empty()) {
+                                // Extracted image path successfully
+                                contentType = "image/png"; // Adjust the content type based on the image type
+                                responseContent = readImage("img/" + imagePath);
+                            } else {
+                                contentType = "text/html";
+                                responseContent = indexHTML;
+                            }
+                        }
+                        std::string httpResponse = generateHTTPResponse(responseContent, contentType);
+                        clients[fds[i].fd].writeBuffer = httpResponse;
                         clients[fds[i].fd].writePos = 0;
-                        fds[i].events = POLLIN | POLLOUT; // Monitor for both read and write events
+                        fds[i].events = POLLIN | POLLOUT;
                     }
                 }
             }
@@ -115,13 +184,12 @@ int main() {
                         close(client.fd);
                         clients.erase(client.fd);
                         fds.erase(fds.begin() + i);
-                        --i; // Adjust index after removal
+                        --i;
                     } else {
                         client.writePos += bytesSent;
                     }
                 }
 
-                // If all data has been sent, stop monitoring for writability
                 if (client.writePos >= client.writeBuffer.size()) {
                     fds[i].events = POLLIN;
                 }
